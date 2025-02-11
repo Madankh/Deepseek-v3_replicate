@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Literal
-
+import torch.distributed as dist
 from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 import math
@@ -279,19 +279,27 @@ class MLA(nn.Module):
         return output
 
 class ParallelEmbedding(nn.Module):
-    """
-    Embedding layer with parallelism support across distributed processes.
-
-    Args:
-        vocab_size (int): Vocabulary size.
-        dim (int): Embedding dimension.
-    """
-
-    def __init__(self, vocab_size:int , dim:int):
+    def __init__(self, vocab_size:int, dim:int):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
+        assert vocab_size % world_size == 0, f"Vocabulary size must be divisible by (world_size={world_size})"
+        self.part_vocab_size = (vocab_size // world_size)
+        self.vocab_start_idx = rank *  self.part_vocab_size
+        self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
 
+    def forward(self, x:torch.Tensor)->torch.Tensor:
+        if world_size > 1:
+            mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
+            x = x - self.vocab_start_idx
+            x[mask] = 0
+        y = F.embedding(x, self.weight)
+
+        if world_size > 1:
+            y[mask] = 0
+            dist.all_reduce(y)
+        return y
 
 
 
