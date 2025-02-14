@@ -301,6 +301,57 @@ class ParallelEmbedding(nn.Module):
             dist.all_reduce(y)
         return y
 
+class MLP(nn.Module):
+    def __init__(self, dim, inter_dim):
+        super().__init__()
+
+        self.w1 = nn.Linear(dim, inter_dim)
+        self.w2 = nn.Linear(inter_dim, dim)
+        self.w3 = nn.Linear(dim, inter_dim)
+
+    def forward(self, x:torch.Tensor)->torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-        
+class Expert(nn.Module):
+    def __init__(self, dim:int, inter_dim:int):
+        super().__init__()
+        self.w1 = nn.Linear(dim, inter_dim);
+        self.w2 = nn.Linear(inter_dim, dim)
+        self.w3 = nn.Linear(dim, inter_dim)
+
+    def forward(self, x:torch.Tensor)->torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x));
+
+class Block(nn.Module):
+    def __init__(self, layer_id:int, args:ModelArgs):
+        super().__init__()
+        self.attn = MLA(args)
+        self.MLP = MLP(args.dim)
+        self.attn_norm = RMSNorm(args.dim)
+        self.ffn_norm = RMSNorm(args.dim)
+
+    def forward(self, x:torch.Tensor, start_pos:int, freqs_cis:torch.Tensor, mask:Optional[torch.Tensor]) -> torch.Tensor:
+        x = self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
+        x = self.MLP(self.ffn_norm(x))
+        return x
+    
+class Transformer(nn.Module):
+    def __init__(self, args:ModelArgs):
+        super().__init__()
+        self.max_seq_len = args.max_seq_len
+        self.embed = ParallelEmbedding(args.vocab_size, args.dim)
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(args.n_layers):
+            self.layers.append(Block(layer_id, args))
+
+        self.norm = RMSNorm(args.dim)
+        self.head = nn.Linear(args.dim, args.vocab_size, dtype=torch.float32)
+        self.register_buffer('freqs_cis', precompute_freqs_cis(args), persistent=False)
+
+    def forward(self, tokens:torch.Tensor, start_pos:int = 0):
+        """Forward pass for the transformer model"""
+
+        seqlen = tokens.size(1)
+        h = self.embed(tokens)
+        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
