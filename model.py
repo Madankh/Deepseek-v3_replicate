@@ -316,29 +316,137 @@ class MLP(nn.Module):
 class Expert(nn.Module):
     def __init__(self, dim:int, inter_dim:int):
         super().__init__()
-        self.w1 = nn.Linear(dim, inter_dim);
+        self.w1 = nn.Linear(dim, inter_dim)
         self.w2 = nn.Linear(inter_dim, dim)
         self.w3 = nn.Linear(dim, inter_dim)
 
     def forward(self, x:torch.Tensor)->torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x));
 
+class Gate(nn.Module):
+    """
+    Gating mechanism for routing inputs in a mixture-of-experts (MoE) model.
+
+    Attributes:
+        dim (int): Dimensionality of input features.
+        topk (int): Number of top experts activated for each input.
+        n_groups (int): Number of groups for routing.
+        topk_groups (int): Number of groups to route inputs to.
+        score_func (str): Scoring function ('softmax' or 'sigmoid').
+        route_scale (float): Scaling factor for routing weights.
+        weight (torch.nn.Parameter): Learnable weights for the gate.
+        bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
+    """
+    def __init__(self, args:ModelArgs):
+        super().__init__()
+        self.dim = args.dim
+        self.topk = args.n_activated_experts
+        self.n_groups = args.n_expert_groups
+        self.topk_groups = args.n_limited_groups
+        self.score_func = args.score_func
+        self.route_scale = args.route_scale
+
+        self.weight = nn.Parameter(torch.empty(self.n_routed_experts, self.dim))
+        self.bias = nn.Parameter(torch.empty(self.n_routed_experts)) if self.dim == 7168 else None
+    
+    def forward(self , x:torch.Tensor)->Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for the gating mechanism."""
+        scores = nn.linear(x, self.weight)
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1, dtpye=torch.float32)
+        else:
+            scores = scores.sigmoid()
+        original_scores = scores
+        if self.bias is not None:
+            scores = scores + self.bias
+        if self.n_groups > 1:
+            scores = scores.view(x.size(0), self.n_groups, -1)
+            if self.bias is None:
+                group_scores = scores.mean(dim=-1)
+            else:
+                group_scores = scores.amax(dim=-1)
+            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+            mask = scores.new_ones(x.size(0), self.n_groups, dtype=torch.bool).scatter_(1, indices, False)
+            scores = scores.masked_fill(mask.unsqueeze(-1), float('-inf')).flatten(1)
+        indices = torch.topk(scores, self.topk, dim=-1)[1]
+        weights = original_scores.gather(1, indices)
+        if self.score_func == "sigmoid":
+            weights /= weights.sum(dim=-1, keepdim=True)
+        weights *= self.route_scale
+        return weights.type_as(x), indices
+    
+
+class MOE(nn.Module):
+    """Mixture of Experts (MoE) model.
+    
+    Attributes:
+        dim (int): Dimensionality of input features.
+        n_routed_experts (int): Total number of experts in the model.
+        n_local_experts (int): Number of experts handled locally in distributed systems.
+        n_activated_experts (int): Number of experts activated for each input.
+        gate (nn.Module): Gating mechanism to route inputs to experts.
+        experts (nn.ModuleList): List of expert modules.
+        shared_experts (nn.Module): Shared experts applied to all inputs.
+    """
+    def __init__(self, args:ModelArgs):
+        super().__init__()
+        self.dim = args.dim
+        self.n_routed_experts = args.n_routed_experts
+        self.n_local_experts = args.n_routed_experts 
+        self.n_activated_experts = args.n_activated_experts
+        self.experts_start_idx = rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        
+        self.gate = Gate(args)
+        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <=i < self.experts_end_idx else None
+                                      for i in range(self.n_routed_experts)])
+        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
+
+    def forward(self, x:torch.Tensor)->torch.Tensor:
+        """ Forward pass for the MoE model.
+        Args:
+            x (torch.Tensor) : Input tensor.
+        Returns:
+            torch.Tensor: Output tensor after expert routing and computation.
+        """
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        weights, indices = self.gate(x)
+        y = torch.zeros_like(x)
+        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+        for i in range(self.exports_start_idx, self.exports_end_idx):
+            if counts[i] == 0:
+                continue
+            expert = self.exports[i]
+            idx, top = torch.where(indices == i)
+            y[idx] += expert(x[idx]) * weights[idx, top, None]
+        z = self.shared_experts(x)
+        if world_size > 1:
+            dist.all_reduce(y)
+        return y.view(*shape) + z.view(*shape)
+    
+
 class Block(nn.Module):
     def __init__(self, layer_id:int, args:ModelArgs):
         super().__init__()
         self.attn = MLA(args)
-        self.MLP = MLP(args.dim)
+        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MOE(args)
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
 
     def forward(self, x:torch.Tensor, start_pos:int, freqs_cis:torch.Tensor, mask:Optional[torch.Tensor]) -> torch.Tensor:
         x = self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
-        x = self.MLP(self.ffn_norm(x))
+        x = self.ffn(self.ffn_norm(x))
         return x
     
 class Transformer(nn.Module):
     def __init__(self, args:ModelArgs):
         super().__init__()
+        global world_size, rank
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
         self.max_seq_len = args.max_seq_len
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)
         self.layers = torch.nn.ModuleList()
@@ -355,3 +463,6 @@ class Transformer(nn.Module):
         seqlen = tokens.size(1)
         h = self.embed(tokens)
         freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float('-inf'), dtype=torch.float32, device=h.device)
