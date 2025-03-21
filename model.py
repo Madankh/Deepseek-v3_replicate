@@ -466,3 +466,21 @@ class Transformer(nn.Module):
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float('-inf'), dtype=torch.float32, device=h.device)
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)
+        logits = self.head(h)
+        if world_size > 1:
+            all_logits = [torch.zeros_like(logits) for _ in range(world_size)]
+            dist.all_gather(all_logits , logits)
+            logits = torch.cat(all_logits, dim=-1)
+        return logits
+    
+if __name__ == "__main__":
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device('cuda')
+    torch.manual_seed(0)
+    args = ModelArgs()
+    x = torch.randint(0, args.vocab_size, (2, 128))
+    model = Transformer(args)
+    print(model(x).size())
